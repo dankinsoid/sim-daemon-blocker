@@ -1,0 +1,61 @@
+#!/bin/bash
+# @ai-generated(solo)
+# Finds the named daemons running inside any iOS/watchOS/tvOS/visionOS simulator
+# and disables them in that simulator's launchd, so they stay off across reboots.
+set -u
+
+if [ $# -eq 0 ]; then
+	echo "usage: $(basename "$0") <daemon-binary-name>..." >&2
+	exit 64
+fi
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
+
+block() {
+	local pid=$1 ppid=$2 name=$3 parent device devset udid label
+
+	parent=$(ps -o command= -p "$ppid")
+	case "$parent" in
+		"launchd_sim "*/data/var/run/launchd_bootstrap.plist) ;;
+		*) log "skip $name[$pid]: parent is not launchd_sim: $parent"; return ;;
+	esac
+	device=${parent#launchd_sim }
+	device=${device%/data/var/run/launchd_bootstrap.plist}
+	udid=${device##*/}
+	# Covers both the regular device set and Xcode's separate Previews set.
+	devset=${device%/*}
+
+	sim() { xcrun simctl --set "$devset" spawn "$udid" "$@" 2>/dev/null; }
+
+	label=$(sim launchctl list | awk -v p="$pid" '$1 == p { print $3 }')
+	if [ -z "$label" ]; then
+		log "skip $name[$pid] in $udid: no launchd job owns this pid"
+		return
+	fi
+
+	# The simulator's launchd keeps Apple daemons in user/foreground but still accepts system/.
+	sim launchctl disable "user/foreground/$label"
+	sim launchctl disable "system/$label"
+	sim launchctl bootout "user/foreground/$label" || sim launchctl bootout "system/$label"
+
+	local i
+	for i in 1 2 3 4 5; do
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 1
+	done
+	if kill -0 "$pid" 2>/dev/null; then
+		kill -9 "$pid" 2>/dev/null
+		log "blocked $label in $udid ($devset): bootout failed, killed"
+	else
+		log "blocked $label in $udid ($devset)"
+	fi
+}
+
+# comm is the full executable path; matching on .simruntime/ leaves the host's own daemons alone.
+ps -axo pid=,ppid=,comm= | while read -r pid ppid comm; do
+	case "$comm" in */*.simruntime/*) ;; *) continue ;; esac
+	name=${comm##*/}
+	for daemon in "$@"; do
+		[ "$name" = "$daemon" ] && block "$pid" "$ppid" "$name"
+	done
+done
